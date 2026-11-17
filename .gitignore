@@ -16,3 +16,7 @@ dist/
 *.m4a
 *.bin
 processed.json
+schedule/
+*.xml
+*.service
+*.timer

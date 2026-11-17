@@ -65,6 +65,6 @@ that needs my attention. In preview mode, report proposed changes only.
 ## Scheduling
 
 Schedule this in your agent application after the local intake has run. The
-included macOS launch-agent generator schedules only audio intake; it does not
+included schedule generator (`scripts/make_schedule.py`) schedules only audio intake; it does not
 install an AI agent, authenticate Todoist, or schedule this routing prompt.
 Run one routing worker at a time to avoid competing task writes.

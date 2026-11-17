@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local macOS voice-recorder intake.
+"""Local voice-recorder intake for macOS, Windows, and Linux.
 
 Copies recordings from explicitly configured folders or enrolled recorder
 volumes, transcribes them with whisper.cpp, structures them with Ollama, and
@@ -9,7 +9,6 @@ writes reviewable Markdown notes. Source recordings are never changed.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -21,10 +20,11 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
@@ -41,7 +41,9 @@ RECORDER_FOLDER_NAMES = (
     "[RECORD]", "RECORD", "Record", "Record File", "Recording",
     "Recordings", "recordings",
 )
-SYSTEM_VOLUMES = {"Macintosh HD", "com.apple.TimeMachine.localsnapshots"}
+MAC_SYSTEM_VOLUMES = {"Macintosh HD", "com.apple.TimeMachine.localsnapshots"}
+LINUX_SKIPPED_MOUNTS = {"/", "/boot", "/boot/efi", "/efi", "/home", "/usr", "/var"}
+LOG_FILE: Path | None = None
 IGNORED_AUDIO_FILENAMES = {"speaker_test.wav", "pro_speaker_test.wav"}
 DEFAULT_BRANDS = ("Workshop", "Personal", "Unclear")
 DEFAULT_WHISPER_PROMPT = (
@@ -60,6 +62,15 @@ class ConfigError(ValueError):
 
 class StateError(RuntimeError):
     """Raised when the processing state cannot be trusted."""
+
+
+def default_state_folder() -> Path:
+    """Per-user application data folder for state, locks, and the model."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "workshop-voice-intake"
 
 
 def _config_path(value: Any, name: str, base: Path) -> Path:
@@ -112,7 +123,7 @@ def load_config(path: Path) -> Config:
 
     base = path.expanduser().resolve().parent
     state = _config_path(
-        raw.get("state_folder", "~/.local/share/workshop-voice-intake"),
+        raw.get("state_folder", str(default_state_folder())),
         "state_folder", base,
     )
     model = _config_path(
@@ -173,7 +184,13 @@ def load_config(path: Path) -> Config:
 
 
 def log(message: str) -> None:
-    print(f"{datetime.now().isoformat(timespec='seconds')} {message}", flush=True)
+    line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
+    if LOG_FILE is not None:
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    # pythonw.exe and some schedulers run without a console.
+    if sys.stdout is not None:
+        print(line, flush=True)
 
 
 def ensure_directories(config: Config) -> None:
@@ -224,15 +241,8 @@ def safe_slug(value: str, fallback: str = "Voice Capture") -> str:
     return (cleaned or fallback)[:100]
 
 
-def mounted_volume_uuid(path: Path) -> str | None:
-    """Return the stable filesystem UUID for a path under /Volumes."""
-    try:
-        relative = path.resolve().relative_to(VOLUMES_FOLDER.resolve())
-    except (OSError, ValueError):
-        return None
-    if not relative.parts:
-        return None
-    volume = VOLUMES_FOLDER / relative.parts[0]
+def _diskutil_uuid(volume: Path) -> str | None:
+    """macOS: return the filesystem UUID reported by diskutil."""
     try:
         result = subprocess.run(
             ["/usr/sbin/diskutil", "info", "-plist", str(volume)],
@@ -243,6 +253,104 @@ def mounted_volume_uuid(path: Path) -> str | None:
         return None
     volume_uuid = info.get("VolumeUUID")
     return str(volume_uuid).upper() if volume_uuid else None
+
+
+def _mac_volumes() -> list[tuple[Path, str | None]]:
+    volumes: list[tuple[Path, str | None]] = []
+    if VOLUMES_FOLDER.exists():
+        for volume in VOLUMES_FOLDER.iterdir():
+            if volume.is_dir() and volume.name not in MAC_SYSTEM_VOLUMES:
+                volumes.append((volume, _diskutil_uuid(volume)))
+    return volumes
+
+
+def format_windows_serial(serial: int) -> str:
+    """Format a volume serial the way the Windows `vol` command prints it."""
+    text = f"{serial & 0xFFFFFFFF:08X}"
+    return f"{text[:4]}-{text[4:]}"
+
+
+def _windows_volumes() -> list[tuple[Path, str | None]]:
+    """Windows: removable and fixed drive letters other than the system drive."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Suppress "insert a disk" dialogs for empty card readers.
+    previous_mode = kernel32.SetErrorMode(0x0001 | 0x8000)
+    system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\").upper()
+    volumes: list[tuple[Path, str | None]] = []
+    try:
+        mask = kernel32.GetLogicalDrives()
+        for index in range(26):
+            if not mask & (1 << index):
+                continue
+            letter = f"{chr(65 + index)}:"
+            root = letter + "\\"
+            # 2 = removable, 3 = fixed. Skip network, optical, and RAM drives.
+            if letter == system_drive or kernel32.GetDriveTypeW(root) not in (2, 3):
+                continue
+            serial = wintypes.DWORD()
+            if kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(root), None, 0, ctypes.byref(serial), None, None, None, 0,
+            ):
+                volumes.append((Path(root), format_windows_serial(serial.value)))
+    finally:
+        kernel32.SetErrorMode(previous_mode)
+    return volumes
+
+
+def _unescape_mount(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _linux_volumes(
+    mounts_file: Path = Path("/proc/self/mounts"),
+    uuid_folder: Path = Path("/dev/disk/by-uuid"),
+) -> list[tuple[Path, str | None]]:
+    """Linux: mounted block devices that have a filesystem UUID."""
+    device_uuids: dict[str, str] = {}
+    try:
+        for link in uuid_folder.iterdir():
+            device_uuids[os.path.realpath(link)] = link.name.upper()
+    except OSError:
+        return []
+    try:
+        lines = mounts_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    volumes: list[tuple[Path, str | None]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        device, mount_point = fields[0], _unescape_mount(fields[1])
+        if mount_point in LINUX_SKIPPED_MOUNTS:
+            continue
+        volume_uuid = device_uuids.get(os.path.realpath(device))
+        if volume_uuid:
+            volumes.append((Path(mount_point), volume_uuid))
+    return volumes
+
+
+def list_mounted_volumes() -> list[tuple[Path, str | None]]:
+    """Return (mount root, stable filesystem ID) for candidate external volumes."""
+    if sys.platform == "darwin":
+        return _mac_volumes()
+    if os.name == "nt":
+        return _windows_volumes()
+    return _linux_volumes()
+
+
+def mounted_volume_uuid(path: Path) -> str | None:
+    """Return the stable filesystem ID of the volume that contains path."""
+    best: tuple[int, str | None] | None = None
+    for root, volume_uuid in list_mounted_volumes():
+        if _within(path, root):
+            depth = len(root.resolve().parts)
+            if best is None or depth > best[0]:
+                best = (depth, volume_uuid)
+    return best[1] if best else None
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -275,7 +383,7 @@ def source_label(path: Path, config: Config) -> str:
     if _within(path, config.drop_folder):
         return "Manual recorder drop"
     if config.icloud_drop_folder and _within(path, config.icloud_drop_folder):
-        return "iCloud recorder drop"
+        return "Synced recorder drop"
     volume_uuid = mounted_volume_uuid(path)
     if volume_uuid in config.recorder_volumes:
         return config.recorder_volumes[volume_uuid]
@@ -288,17 +396,14 @@ def discover_source_folders(config: Config, extra_sources: list[Path]) -> list[P
         folders.append(config.icloud_drop_folder)
     folders.extend(extra_sources)
 
-    if VOLUMES_FOLDER.exists():
-        for volume in VOLUMES_FOLDER.iterdir():
-            if not volume.is_dir() or volume.name in SYSTEM_VOLUMES:
-                continue
-            # Automatic import is permitted only for explicitly enrolled UUIDs.
-            if mounted_volume_uuid(volume) not in config.recorder_volumes:
-                continue
-            for folder_name in RECORDER_FOLDER_NAMES:
-                candidate = volume / folder_name
-                if candidate.is_dir() and _within(candidate, volume):
-                    folders.append(candidate)
+    for volume, volume_uuid in list_mounted_volumes():
+        # Automatic import is permitted only for explicitly enrolled IDs.
+        if volume_uuid is None or volume_uuid not in config.recorder_volumes:
+            continue
+        for folder_name in RECORDER_FOLDER_NAMES:
+            candidate = volume / folder_name
+            if candidate.is_dir() and _within(candidate, volume):
+                folders.append(candidate)
 
     unique: list[Path] = []
     seen: set[str] = set()
@@ -365,9 +470,12 @@ def archive_recording(source: Path, file_hash: str, config: Config) -> Path:
 
 
 def resolve_executable(value: str) -> str | None:
-    if os.sep in value:
+    has_folder = os.sep in value or bool(os.altsep and os.altsep in value)
+    if has_folder or value.startswith("~"):
         path = Path(value).expanduser()
-        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        if path.is_file() and (os.name == "nt" or os.access(path, os.X_OK)):
+            return str(path)
+        return None
     return shutil.which(value)
 
 
@@ -649,20 +757,27 @@ def download_model(config: Config) -> None:
         log(f"Whisper model already installed and verified: {config.model_path}")
         return
     temporary = config.model_path.with_suffix(".download")
-    temporary.unlink(missing_ok=True)
-    curl = resolve_executable("curl")
-    if not curl:
-        raise RuntimeError("curl is required to download the Whisper model")
     log("Downloading the local Whisper small.en model (about 466 MB)...")
-    subprocess.run([
-        curl, "--fail", "--location", "--retry", "5", "--retry-all-errors",
-        "--remove-on-error", "--output", str(temporary), MODEL_URL,
-    ], check=True)
-    if temporary.stat().st_size != MODEL_SIZE or sha256(temporary) != MODEL_SHA256:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
         temporary.unlink(missing_ok=True)
-        raise RuntimeError("Whisper model download failed size or SHA-256 verification")
-    temporary.replace(config.model_path)
-    log(f"Installed Whisper model: {config.model_path}")
+        try:
+            digest = hashlib.sha256()
+            request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "voice-intake"})
+            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as out:
+                for block in iter(lambda: response.read(1024 * 1024), b""):
+                    out.write(block)
+                    digest.update(block)
+            if temporary.stat().st_size != MODEL_SIZE or digest.hexdigest() != MODEL_SHA256:
+                raise RuntimeError("download failed size or SHA-256 verification")
+            temporary.replace(config.model_path)
+            log(f"Installed Whisper model: {config.model_path}")
+            return
+        except (OSError, urllib.error.URLError, RuntimeError) as error:
+            last_error = error
+            log(f"Download attempt {attempt} failed: {error}")
+    temporary.unlink(missing_ok=True)
+    raise RuntimeError(f"Whisper model download failed: {last_error}")
 
 
 def check_dependencies(config: Config, extra_sources: list[Path]) -> int:
@@ -718,16 +833,52 @@ def check_dependencies(config: Config, extra_sources: list[Path]) -> int:
     return 0 if not failures else 2
 
 
+@contextmanager
+def exclusive_lock(path: Path) -> Iterator[bool]:
+    """Non-blocking lock across processes; yields False if another scan holds it."""
+    with path.open("a+b") as handle:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def print_volumes() -> int:
+    """List mounted volumes and the IDs to copy into recorder_volumes."""
+    volumes = list_mounted_volumes()
+    if not volumes:
+        log("No candidate external volumes found. Plug in the recorder and try again.")
+        return 0
+    for root, volume_uuid in volumes:
+        print(f"{volume_uuid or '(no ID available)'}\t{root}")
+    return 0
+
+
 def scan(config: Config, extra_sources: list[Path]) -> int:
     validate_source_boundaries(config, extra_sources)
     ensure_directories(config)
     if not config.model_path.exists():
         log("Whisper model missing. Run this script with --install.")
         return 2
-    with config.lock_file.open("w") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with exclusive_lock(config.lock_file) as acquired:
+        if not acquired:
             log("Another voice-intake scan is already running.")
             return 0
         folders = discover_source_folders(config, extra_sources)
@@ -740,16 +891,27 @@ def scan(config: Config, extra_sources: list[Path]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, type=Path, help="Path to the JSON configuration file.")
+    parser.add_argument("--config", type=Path, help="Path to the JSON configuration file.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--install", action="store_true", help="Create folders and download the Whisper model.")
     mode.add_argument("--check", action="store_true", help="Validate config and dependencies without making changes.")
+    mode.add_argument("--list-volumes", action="store_true", help="Show mounted volumes and their IDs for recorder_volumes.")
     parser.add_argument("--source", action="append", default=[], type=Path, help="Additional explicit source folder; repeatable.")
+    parser.add_argument("--log-file", type=Path, help="Also append log lines to this file.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+    global LOG_FILE
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    if arguments.log_file is not None:
+        LOG_FILE = arguments.log_file.expanduser()
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if arguments.list_volumes:
+        return print_volumes()
+    if arguments.config is None:
+        parser.error("--config is required")
     try:
         config = load_config(arguments.config)
         sources = [item.expanduser().resolve() for item in arguments.source]
