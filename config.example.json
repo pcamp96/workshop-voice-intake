@@ -1,0 +1,9 @@
+{
+  "drop_folder": "~/Documents/Workshop Voice Intake/Drop",
+  "archive_folder": "~/Documents/Workshop Voice Intake/Archive",
+  "output_folder": "~/Documents/Workshop Voice Intake/Notes",
+  "ollama_model": "gemma3:12b",
+  "whisper_prompt": "Todoist, Obsidian, laser engraving, CNC router, 3D printing.",
+  "brands": ["Workshop", "Personal", "Unclear"],
+  "recorder_volumes": {}
+}
